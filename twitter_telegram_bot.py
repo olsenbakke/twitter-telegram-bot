@@ -113,11 +113,14 @@ def _flush_dedup_to_file() -> None:
     _save_sent_ids_file(data)
 
 # =============================
-# Translation Engine
+# Translation Engine (Aerolink Gateway)
 # =============================
-GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "").strip()
-translator          = None
-groq_client         = None
+import httpx
+
+AEROLINK_API_KEY  = os.getenv("AEROLINK_API_KEY", "").strip()
+AEROLINK_BASE_URL = os.getenv("AEROLINK_BASE_URL", "").rstrip("/")
+AEROLINK_MODEL    = os.getenv("AEROLINK_MODEL", "gpt-4o-mini").strip()
+
 translate_engine_name = "off"
 translate_cache: Dict[str, str] = {}
 
@@ -135,7 +138,8 @@ CRYPTO_TERMS = [
     "tokenomics", "gas fee", "gas", "layer 2", "l2", "layer 1", "l1",
     "rollup", "rollups", "zk", "on-chain", "off-chain", "governance",
     "validator", "validators", "node", "nodes", "rpc", "api",
-    "airdrop hunter", "airdrop hunters",
+    "airdrop hunter", "airdrop hunters", "proof", "proofs", "verification",
+    "verify", "early", "building", "trust"
 ]
 _crypto_terms_pattern = "|".join(re.escape(t) for t in sorted(CRYPTO_TERMS, key=len, reverse=True))
 PROTECTED_RE = re.compile(
@@ -145,34 +149,19 @@ PROTECTED_RE = re.compile(
 )
 
 def init_translator() -> None:
-    global translator, groq_client, translate_engine_name
-    if not TRANSLATE_FA or TRANSLATE_ENGINE == "off":
-        translate_engine_name = "off"
-        return
-    if TRANSLATE_ENGINE in ("auto", "groq", "groq-ai") and GROQ_API_KEY:
-        try:
-            from groq import Groq  # type: ignore
-            groq_client = Groq(api_key=GROQ_API_KEY)
-            translate_engine_name = "groq-ai"
-            logger.info("Translator: Groq AI enabled")
-            if TRANSLATE_ENGINE in ("groq", "groq-ai"):
-                return
-        except Exception as e:
-            logger.warning(f"Groq init failed: {e}")
-            groq_client = None
-    if TRANSLATE_ENGINE in ("auto", "google", "") or not groq_client:
+    global translate_engine_name
+    if TRANSLATE_FA and AEROLINK_API_KEY and AEROLINK_BASE_URL:
+        translate_engine_name = "aerolink-ai"
+        logger.info(f"Translator: Aerolink AI gateway enabled using {AEROLINK_MODEL}")
+    else:
         try:
             from deep_translator import GoogleTranslator
+            global translator
             translator = GoogleTranslator(source="auto", target="fa")
             translate_engine_name = "google"
-            logger.info("Translator: Google enabled")
-        except Exception as e:
-            logger.warning(f"Google translator disabled: {e}")
-            translator = None
-            if not groq_client:
-                translate_engine_name = "off"
-
-init_translator()
+            logger.info("Translator: Aerolink fallback to Google")
+        except Exception:
+            translate_engine_name = "off"
 
 def normalize_tweet_text(text: str) -> str:
     text = html.unescape(text or "")
@@ -191,45 +180,15 @@ def persian_ratio(text: str) -> float:
         return 0.0
     return len(re.findall(r"[\u0600-\u06FF]", text or "")) / len(letters)
 
-def protect_special_terms(text: str) -> Tuple[str, List[Tuple[str, str]]]:
-    protected: List[Tuple[str, str]] = []
-    def repl(m: re.Match) -> str:
-        tok = f"XTBKEEP{len(protected):03d}X"
-        protected.append((tok, m.group(0)))
-        return tok
-    return PROTECTED_RE.sub(repl, text), protected
-
-def restore_special_terms(text: str, protected: List[Tuple[str, str]]) -> str:
-    for tok, val in protected:
-        text = re.sub(re.escape(tok), val, text, flags=re.IGNORECASE)
-    return text
-
-def postprocess_persian_translation(text: str) -> str:
-    replacements = {
-        "قطره هوایی": "airdrop", "قطره‌های هوایی": "airdrops",
-        "ایردراپ": "airdrop", "ایردراپ‌ها": "airdrops",
-        "شبکه اصلی": "mainnet", "شبکه آزمایشی": "testnet",
-        "فهرست شدن": "لیست شدن", "فهرست شده": "لیست شده",
-        "فهرست می‌شود": "لیست می‌شود",
-        "سهام گذاری": "staking", "سهام‌گذاری": "staking",
-        "کیف پول": "ولت", "کیف‌پول": "ولت",
-        "رمزنگاری": "کریپتو", "ارز دیجیتال": "کریپتو",
-        "ارزهای دیجیتال": "کریپتوها",
-        "نشانه": "توکن", "نشانه‌ها": "توکن‌ها",
-        "ادعا کنید": "claim کنید", "مطالب کنید": "claim کنید",
-        "راه اندازی": "لانچ", "راه‌اندازی": "لانچ",
-        "صعودی": "bullish", "نزولی": "bearish",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    text = re.sub(r"\s+([،؛؟.!?])", r"\1", text)
-    text = re.sub(r"([؟!]){3,}", r"\1\1", text)
-    return re.sub(r"[ \t]+", " ", text).strip()
-
-def translate_with_groq(text: str) -> Optional[str]:
-    if not groq_client:
+def translate_with_aerolink(text: str) -> Optional[str]:
+    if not AEROLINK_API_KEY or not AEROLINK_BASE_URL:
         return None
     try:
+        url = f"{AEROLINK_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {AEROLINK_API_KEY}",
+            "Content-Type": "application/json"
+        }
         prompt = (
             "You are an expert Persian crypto influencer and telegram admin.\n"
             "Translate the following English tweet into smooth, concise, and colloquial (عامیانه/تهرانی) Persian, "
@@ -238,36 +197,41 @@ def translate_with_groq(text: str) -> Optional[str]:
             "1. NEVER use formal/bookish Persian (like می باشد، است، کلمات کتابی). Use natural conversational tone (مثلا: داره، می‌شه، انجام بدین، برایِ).\n"
             "2. DO NOT translate crypto tech terms. Leave these words EXACTLY in English: "
             "Airdrop, Mainnet, Testnet, Mint, Stake, Staking, Claim, Snapshot, Node, Validator, Whitelist, Listing, "
-            "Wallet, Bridge, Swap, Presale, Launchpad, Gas, L1, L2, TVL, IDO, TGE, Hodl, FOMO, FUD.\n"
+            "Wallet, Bridge, Swap, Presale, Launchpad, Gas, L1, L2, TVL, IDO, TGE, Hodl, FOMO, FUD, Proof, Verification, Early, Building.\n"
             "3. Keep all @usernames, #hashtags, $tickers, and URLs exactly as they are in the original text.\n"
             "4. Output ONLY the Persian translation. No explanations, no introduction, no quotes.\n\n"
             f"Text to translate: {text}"
         )
-        completion = groq_client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=600,
-        )
-        return completion.choices[0].message.content.strip().strip('"\'\n ') or None
+        payload = {
+            "model": AEROLINK_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        }
+        
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            response = client.post(url, headers=headers, json=payload)
+            if response.status_code == 200:
+                res_data = response.json()
+                result = res_data["choices"][0]["message"]["content"].strip()
+                return result.strip('"\'\n ') or None
+            else:
+                logger.warning(f"Aerolink API error: Status {response.status_code} - {response.text}")
+                return None
     except Exception as e:
-        logger.warning(f"Groq translate failed: {e}")
+        logger.warning(f"Aerolink translate failed: {e}")
         return None
 
 def translate_with_google(text: str) -> Optional[str]:
-    if not translator:
-        return None
-    protected_text, protected = protect_special_terms(text[:4500])
     try:
-        result = translator.translate(protected_text)
+        from deep_translator import GoogleTranslator
+        g_translator = GoogleTranslator(source="auto", target="fa")
+        result = g_translator.translate(text[:4500])
+        if result:
+            result = re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+', '', html.unescape(result))
+            return result.strip()
     except Exception as e:
-        logger.warning(f"Google translate failed: {e}")
-        return None
-    if not result:
-        return None
-    result = html.unescape(result)
-    result = restore_special_terms(result, protected)
-    return postprocess_persian_translation(result) or None
+        logger.warning(f"Google fallback failed: {e}")
+    return None
 
 def translate_fa(text: str) -> Optional[str]:
     if not TRANSLATE_FA:
@@ -277,29 +241,20 @@ def translate_fa(text: str) -> Optional[str]:
         return None
     if cleaned in translate_cache:
         return translate_cache[cleaned]
-    result = None
-    if groq_client and TRANSLATE_ENGINE in ("auto", "groq", "groq-ai"):
-        result = translate_with_groq(cleaned)
-    if not result and translator:
+        
+    result = translate_with_aerolink(cleaned)
+    if not result:
         result = translate_with_google(cleaned)
+        
     if not result or result.strip() == cleaned.strip():
         return None
+        
     if len(translate_cache) >= TRANSLATE_CACHE_MAX:
         translate_cache.pop(next(iter(translate_cache)), None)
     translate_cache[cleaned] = result
     return result
 
-def get_translate_status() -> str:
-    if not TRANSLATE_FA: return "خاموش ❌"
-    if groq_client and TRANSLATE_ENGINE in ("auto", "groq", "groq-ai"): return "AI Groq ✅"
-    if translator: return "Google ✅"
-    return "خاموش ❌"
-
-def get_translate_data_engine() -> str:
-    if not TRANSLATE_FA: return "off"
-    if groq_client and TRANSLATE_ENGINE in ("auto", "groq", "groq-ai"): return "Groq AI"
-    if translator: return "Google"
-    return "off"
+init_translator()
 
 # =============================
 # Storage & Data Management
