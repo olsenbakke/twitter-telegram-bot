@@ -1035,91 +1035,122 @@ async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(msg)
 
 # =============================
-# Backup / Restore
+# Background checker
 # =============================
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat: return
-    chat_id = update.effective_chat.id
-    if not is_admin_chat(chat_id):
-        await _reply(update, "⛔️ فقط ادمین‌های مجاز سرور دسترسی دارند.")
+async def auto_backup(app: Application) -> None:
+    enable_backup_env = os.getenv("ENABLE_BACKUP", "true").lower() in ("1", "true", "yes", "on")
+    auto_backup_env = os.getenv("AUTO_BACKUP", "true").lower() in ("1", "true", "yes", "on")
+    
+    if not enable_backup_env or not auto_backup_env:
+        logger.info("Auto-backup is completely DISABLED via environment variables.")
         return
-    
-    _flush_dedup_to_file()
-    
-    for path, name, caption in [
-        (DATA_FILE,     "tracked_users.json", f"📦 tracked_users — {len(tracked)} اکانت"),
-        (FILTERS_FILE,  "filters.json",       f"📦 filters — {len(filters_db.get('chats', {}))} چت"),
-        (SENT_IDS_FILE, "sent_ids.json",      "📦 sent_ids (dedup)"),
-    ]:
-        if os.path.exists(path):
-            try:
-                await context.bot.send_document(chat_id=chat_id, document=open(path, "rb"), filename=name, caption=caption)
-            except Exception as e:
-                logger.warning(f"Export {name} failed: {e}")
-    await _reply(update, "✅ بکاپ اختصاصی برای شما ارسال شد.")
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global tracked, filters_db
-    if not update.effective_chat or not update.message or not update.message.document: return
-    chat_id = update.effective_chat.id
-    if not is_admin_chat(chat_id):
-        await update.message.reply_text("⛔️ فقط ادمین‌های مجاز سرور دسترسی دارند.")
-        return
-    doc      = update.message.document
-    filename = doc.file_name or ""
-    if filename not in ("tracked_users.json", "filters.json", "sent_ids.json"):
-        await update.message.reply_text("فقط فایل‌های json سیستم قبول می‌شوند.")
-        return
-    try:
-        tg_file  = await context.bot.get_file(doc.file_id)
-        tmp_path = os.path.join(DATA_DIR, f".{filename}.tmp")
-        dest     = os.path.join(DATA_DIR, filename)
-        await tg_file.download_to_drive(tmp_path)
-        with open(tmp_path, "r", encoding="utf-8") as f:
-            new_data = json.load(f)
-        os.replace(tmp_path, dest)
-        if filename == "tracked_users.json":
-            tracked.clear(); tracked.update(new_data if isinstance(new_data, dict) else {})
-            normalize_tracked_db(); save_tracked()
-            await update.message.reply_text(f"✅ دیتابیس کاربران آپدیت شد — {len(tracked)} اکانت")
-        elif filename == "filters.json":
-            filters_db.clear(); filters_db.update(new_data if isinstance(new_data, dict) else default_filters())
-            normalize_filters_db(); save_filters()
-            await update.message.reply_text("✅ فیلترهای سیستم با موفقیت درون‌ریزی شد.")
-        elif filename == "sent_ids.json":
-            _dedup_ram.clear()
-            for key, ids in (new_data if isinstance(new_data, dict) else {}).items():
-                if isinstance(ids, list):
-                    _dedup_ram[key] = set(ids[-DEDUP_MAX_PER_CHAT:])
+    await asyncio.sleep(60)
+    while True:
+        try:
             _flush_dedup_to_file()
-            total = sum(len(v) for v in _dedup_ram.values())
-            await update.message.reply_text(f"✅ دیتابیس ضد تکرار بارگذاری شد — {total} ID")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در وارد کردن فایل: {e}")
+            logger.info("Dedup database auto-flushed to file.")
+            if ADMIN_IDS:
+                caption_map = {
+                    DATA_FILE:     f"📦 auto-backup tracked_users — {len(tracked)} اکانت",
+                    FILTERS_FILE:  f"📦 auto-backup filters — {len(filters_db.get('chats', {}))} چت",
+                    SENT_IDS_FILE: f"📦 auto-backup sent_ids — {sum(len(v) for v in _dedup_ram.values())} ID",
+                }
+                name_map = {
+                    DATA_FILE:     "tracked_users.json",
+                    FILTERS_FILE:  "filters.json",
+                    SENT_IDS_FILE: "sent_ids.json",
+                }
+                for aid in ADMIN_IDS:
+                    for path, caption in caption_map.items():
+                        if os.path.exists(path):
+                            try:
+                                with open(path, "rb") as f:
+                                    await app.bot.send_document(
+                                        chat_id=int(aid),
+                                        document=f,
+                                        filename=name_map[path],
+                                        caption=caption,
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Auto-backup {path} failed for admin {aid}: {e}")
+                logger.info(f"Auto-backup sent to all admins: {', '.join(ADMIN_IDS)}")
+        except Exception as e:
+            logger.error(f"Auto-backup error: {e}")
+            
+        await asyncio.sleep(BACKUP_INTERVAL)
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat: return
-    chat_id      = update.effective_chat.id
-    cf           = get_chat_filters(chat_id)
-    my_accounts  = len([u for u, i in tracked.items() if any(same_chat_id(chat_id, c) for c in i.get("chats", []))])
-    dedup_count  = len(_dedup_ram.get(_dedup_key(chat_id), set()))
-    total_chats  = len({str(c) for i in tracked.values() for c in i.get("chats", [])})
-    await _reply(
-        update,
-        f"📊 <b>آمار سیستم مرکزی TweetBaan</b>\n\n"
-        f"اکانت‌های فعال این چت: {my_accounts}\n"
-        f"کل اکانت‌های مانیتور شده سرور: {len(tracked)}\n"
-        f"کل کانال‌ها/گروه‌های متصل: {total_chats}\n"
-        f"کلمات کلیدی فیلتر شما: {len(cf.get('keywords', []))}\n"
-        f"کلمات آلارم شما: {len(cf.get('alert_keywords', []))}\n"
-        f"فیلتر ریتوییت: {'ON' if cf.get('filter_rt') else 'OFF'}\n"
-        f"فیلتر ریپلای: {'ON' if cf.get('filter_replies') else 'OFF'}\n"
-        f"موتور ترجمه سرور: {get_translate_data_engine()}\n"
-        f"تعداد ادمین‌های سرور: {len(ADMIN_IDS)}\n"
-        f"مخزن دیتا: <code>{DATA_DIR}</code>",
-        parse_mode=ParseMode.HTML,
-    )
 
+# جابجا کردن این تابع به اینجای کد (قبل از دستورات ادمین و متد post_init)
+async def check_twitter_updates(app: Application) -> None:
+    while True:
+        if not tracked:
+            await asyncio.sleep(CHECK_INTERVAL)
+            continue
+
+        for username, info in list(tracked.items()):
+            try:
+                feed = await fetch_rss_feed(username)
+                if not feed or not feed.entries:
+                    await asyncio.sleep(1.5)
+                    continue
+
+                last_id       = str(info.get("last_id", ""))
+                new_entries   = []
+                found_last_id = False
+
+                for entry in feed.entries:
+                    tid = extract_tweet_id(entry)
+                    if last_id and tid == last_id:
+                        found_last_id = True
+                        break
+                    new_entries.append(entry)
+
+                if last_id and not found_last_id:
+                    chats_of_user = list(info.get("chats", []))
+                    truly_new = []
+                    for e in new_entries:
+                        tid = extract_tweet_id(e)
+                        if not any(is_already_sent(c, tid) for c in chats_of_user):
+                            truly_new.append(e)
+                    
+                    if len(truly_new) > MAX_BACKFILL_ON_MISSING_LAST_ID:
+                        truly_new = truly_new[:MAX_BACKFILL_ON_MISSING_LAST_ID]
+                    new_entries = truly_new
+
+                if not new_entries:
+                    await asyncio.sleep(1.5)
+                    continue
+
+                processed_ids: List[str] = []
+
+                for entry in reversed(new_entries):
+                    tid = extract_tweet_id(entry)
+                    if not tid:
+                        continue
+
+                    for chat_id in list(info.get("chats", [])):
+                        if is_already_sent(chat_id, tid):
+                            continue
+                        try:
+                            await send_tweet_entry(chat_id, username, entry, app.bot)
+                        except Exception as e:
+                            logger.error(f"send_tweet_entry error {username}/{tid}: {e}")
+                        await asyncio.sleep(0.3)
+
+                    processed_ids.append(tid)
+
+                if processed_ids and username in tracked:
+                    tracked[username]["last_id"] = str(processed_ids[-1])
+                    save_tracked()
+                    logger.info(f"[{username}] last_id → {processed_ids[-1]} ({len(processed_ids)} processed)")
+
+                await asyncio.sleep(1.5)
+
+            except Exception as e:
+                logger.error(f"Check failed for {username}: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL)
 # =============================
 # Bot setup
 # =============================
