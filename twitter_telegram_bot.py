@@ -180,6 +180,20 @@ def persian_ratio(text: str) -> float:
         return 0.0
     return len(re.findall(r"[\u0600-\u06FF]", text or "")) / len(letters)
 
+def get_translate_data_engine() -> str:
+    if not TRANSLATE_FA: 
+        return "off"
+    if AEROLINK_API_KEY and AEROLINK_BASE_URL: 
+        return f"Aerolink AI ({AEROLINK_MODEL})"
+    return "Google Fallback"
+
+def get_translate_status() -> str:
+    if not TRANSLATE_FA: 
+        return "خاموش ❌"
+    if AEROLINK_API_KEY and AEROLINK_BASE_URL: 
+        return f"Aerolink AI ({AEROLINK_MODEL}) ✅"
+    return "Google Fallback ✅"
+
 def translate_with_aerolink(text: str) -> Optional[str]:
     if not AEROLINK_API_KEY or not AEROLINK_BASE_URL:
         return None
@@ -255,7 +269,6 @@ def translate_fa(text: str) -> Optional[str]:
     return result
 
 init_translator()
-
 # =============================
 # Storage & Data Management
 # =============================
