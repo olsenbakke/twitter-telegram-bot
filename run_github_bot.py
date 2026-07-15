@@ -1,54 +1,86 @@
 import os
 import json
 import re
-import xml.etree.ElementTree as ET
-from copy import deepcopy
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
-ADMIN_IDS = [x.strip() for x in ADMIN_CHAT_ID.split(",") if x.strip()]
-
-DATA_FILE = "tracked_users.json"
-FILTERS_FILE = "filters.json"
-SENT_IDS_FILE = "sent_ids.json"
-OFFSET_FILE = "tg_offset.json"
+CF_WORKER_URL = os.getenv("CF_WORKER_URL", "").rstrip("/")
+CF_API_SECRET = os.getenv("CF_API_SECRET", "")
 
 # ==========================================
-# DATABASE LOAD/SAVE (LOCAL JSON FILES)
+# CLOUDFLARE KV DATABASE API WRAPPERS
 # ==========================================
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Failed to load {path}: {e}")
-            return deepcopy(default)
-    return deepcopy(default)
-
-def save_json(path, data):
+def load_json_from_cf(key_name, default_val):
+    if not CF_WORKER_URL or not CF_API_SECRET:
+        print("Warning: CF_WORKER_URL or CF_API_SECRET is missing. Using default local fallback.")
+        # Fallback to local files
+        if os.path.exists(f"{key_name}.json"):
+            try:
+                with open(f"{key_name}.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                pass
+        return default_val
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        url = f"{CF_WORKER_URL}/api/kv?key={key_name}"
+        headers = {"X-API-Key": CF_API_SECRET}
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            print(f"Loaded '{key_name}' successfully from Cloudflare KV.")
+            return r.json()
+        else:
+            print(f"Warning: Failed to load '{key_name}' from KV, status: {r.status_code}. Using local fallback.")
+    except Exception as e:
+        print(f"Error loading '{key_name}' from KV: {e}")
+        
+    # Local fallback
+    if os.path.exists(f"{key_name}.json"):
+        try:
+            with open(f"{key_name}.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return default_val
+
+def save_json_to_cf(key_name, data):
+    # Save locally
+    try:
+        with open(f"{key_name}.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Failed to save {path}: {e}")
+        print(f"Failed local write for {key_name}: {e}")
 
-tracked = load_json(DATA_FILE, {})
-filters_db = load_json(FILTERS_FILE, {"chats": {}})
-sent_ids = load_json(SENT_IDS_FILE, {})
+    if not CF_WORKER_URL or not CF_API_SECRET:
+        print("Warning: CF_WORKER_URL or CF_API_SECRET is missing. Cannot save to Cloudflare.")
+        return
+    try:
+        url = f"{CF_WORKER_URL}/api/kv?key={key_name}"
+        headers = {"X-API-Key": CF_API_SECRET, "Content-Type": "application/json"}
+        r = requests.post(url, headers=headers, json=data, timeout=12)
+        if r.status_code == 200:
+            print(f"Saved '{key_name}' successfully to Cloudflare KV.")
+        else:
+            print(f"Error: Failed to save '{key_name}' to KV, status: {r.status_code}")
+    except Exception as e:
+        print(f"Error saving '{key_name}' to KV: {e}")
+
+# Load databases from Cloudflare KV
+tracked = load_json_from_cf("tracked_users", {})
+sent_ids = load_json_from_cf("sent_ids", {})
+
+# We no longer need to process commands in GitHub Actions!
+# Cloudflare Worker processes commands instantly (via Webhook) and writes them to KV!
+# GitHub Actions only wakes up to check Twitter, fetch the lists from KV, and forward new tweets.
+# This provides INSTANT commands and RELIABLE Twitter scraping!
 
 def save_tracked():
-    save_json(DATA_FILE, tracked)
-
-def save_filters():
-    save_json(FILTERS_FILE, filters_db)
+    save_json_to_cf("tracked_users", tracked)
 
 def save_sent_ids():
-    save_json(SENT_IDS_FILE, sent_ids)
+    save_json_to_cf("sent_ids", sent_ids)
 
 # ==========================================
 # TELEGRAM API HELPERS
@@ -83,8 +115,8 @@ def send_media_group(chat_id, imageUrls, caption):
     for i, img in enumerate(imageUrls[:10]):
         item = {"type": "photo", "media": img}
         if i == 0:
-            item["caption"] = caption;
-            item["parse_mode"] = "HTML";
+            item["caption"] = caption
+            item["parse_mode"] = "HTML"
         media.append(item)
     try:
         requests.post(url, json={
@@ -95,162 +127,7 @@ def send_media_group(chat_id, imageUrls, caption):
         print(f"Error sending media group to {chat_id}: {e}")
 
 # ==========================================
-# TELEGRAM COMMANDS PROCESSOR (getUpdates)
-# ==========================================
-def process_telegram_commands():
-    offset = 0
-    if os.path.exists(OFFSET_FILE):
-        try:
-            with open(OFFSET_FILE, "r") as f:
-                offset = json.load(f).get("offset", 0)
-        except:
-            pass
-
-    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?timeout=5"
-    if offset > 0:
-        url += f"&offset={offset}"
-
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return
-        updates = r.json().get("result", [])
-    except Exception as e:
-        print(f"Error getting updates: {e}")
-        return
-
-    if not updates:
-        return
-
-    global tracked, filters_db
-    highest_id = 0
-
-    for u in updates:
-        update_id = u.get("update_id", 0)
-        if update_id > highest_id:
-            highest_id = update_id
-
-        message = u.get("message")
-        if not message or "text" not in message:
-            continue
-
-        chat_id = str(message["chat"]["id"])
-        text = message["text"].strip()
-
-        # Auth Check
-        if ADMIN_IDS and chat_id not in ADMIN_IDS:
-            send_msg(chat_id, "❌ شما دسترسی لازم برای استفاده از این ربات را ندارید.")
-            continue
-
-        args = text.split()
-        if not args:
-            continue
-        command = args[0].lower()
-
-        # Handle Commands
-        if command == "/start":
-            welcome = (
-                "<b>به ربات فوروارد توییتر خوش آمدید! 🐦 (نسخه گیت‌هاب اکشنز)</b>\n\n"
-                "این ربات هر ۱۰ دقیقه بیدار شده، کامندهای شما را پردازش کرده و توییت‌های جدید را ارسال می‌کند.\n\n"
-                "📌 <b>راهنمای دستورات:</b>\n"
-                "• <code>/add username1 username2</code> : شروع ردیابی اکانت‌ها\n"
-                "• <code>/del username1 username2</code> : حذف اکانت‌ها\n"
-                "• <code>/list</code> : لیست اکانت‌های فعال\n"
-                "• <code>/filter_rt</code> : فعال/غیرفعال کردن ری‌توییت‌ها\n"
-                "• <code>/filter_reply</code> : فعال/غیرفعال کردن ریپلای‌ها\n"
-                "• <code>/keywords add [کلمه]</code> : فیلتر کلمه کلیدی\n"
-                "• <code>/keywords del [کلمه]</code> : حذف کلمه کلیدی\n"
-                "• <code>/keywords list</code> : لیست کلمات کلیدی"
-            )
-            send_msg(chat_id, welcome)
-
-        elif command == "/add":
-            if len(args) < 2:
-                send_msg(chat_id, "❌ لطفا حداقل یک یوزرنیم وارد کنید.\nمثال: <code>/add vitalikbuterin elonmusk</code>")
-                continue
-            usernames = [u.replace("@", "").lower().strip() for u in args[1:]]
-            added = []
-            for u in usernames:
-                if not u: continue
-                if u not in tracked:
-                    tracked[u] = {"last_id": "", "chats": []}
-                if chat_id not in tracked[u]["chats"]:
-                    tracked[u]["chats"].append(chat_id)
-                    added.append(u)
-            save_tracked()
-            send_msg(chat_id, f"✅ اکانت‌های زیر به لیست ردیابی اضافه شدند:\n" + "\n".join([f"• @{x}" for x in added]))
-
-        elif command == "/del":
-            if len(args) < 2:
-                send_msg(chat_id, "❌ لطفا حداقل یک یوزرنیم وارد کنید.\nمثال: <code>/del vitalikbuterin</code>")
-                continue
-            usernames = [u.replace("@", "").lower().strip() for u in args[1:]]
-            deleted = []
-            for u in usernames:
-                if u in tracked and chat_id in tracked[u]["chats"]:
-                    tracked[u]["chats"].remove(chat_id)
-                    if not tracked[u]["chats"]:
-                        del tracked[u]
-                    deleted.append(u)
-            save_tracked()
-            send_msg(chat_id, f"✅ اکانت‌های زیر از لیست ردیابی حذف شدند:\n" + "\n".join([f"• @{x}" for x in deleted]))
-
-        elif command == "/list":
-            lst = [f"• @{u}" for u, info in tracked.items() if chat_id in info["chats"]]
-            if lst:
-                send_msg(chat_id, f"📋 <b>تعداد {len(lst)} اکانت فعال در این چت:</b>\n\n" + "\n".join(lst))
-            else:
-                send_msg(chat_id, "📭 هیچ اکانتی در حال حاضر ردیابی نمی‌شود.")
-
-        elif command == "/filter_rt":
-            filters_db.setdefault("chats", {})
-            filters_db["chats"].setdefault(chat_id, {})
-            rt_status = "فعال" if filters_db["chats"][chat_id]["filter_rt"] else "غیرفعال"
-            send_msg(chat_id, f"✅ فیلتر ری‌توییت <b>{rt_status}</b> شد.")
-
-        elif command == "/filter_reply":
-            filters_db.setdefault("chats", {})
-            filters_db["chats"].setdefault(chat_id, {})
-            filters_db["chats"][chat_id]["filter_reply"] = not filters_db["chats"][chat_id].get("filter_reply", True)
-            save_filters()
-            reply_status = "فعال" if filters_db["chats"][chat_id]["filter_reply"] else "غیرفعال"
-            send_msg(chat_id, f"✅ فیلتر ریپلای <b>{reply_status}</b> شد.")
-
-        elif command == "/keywords":
-            filters_db.setdefault("chats", {})
-            filters_db["chats"].setdefault(chat_id, {})
-            filters_db["chats"][chat_id].setdefault("keywords", [])
-            
-            sub = args[1].lower() if len(args) > 1 else ""
-            if sub == "add" and len(args) > 2:
-                word = " ".join(args[2:]).lower().strip()
-                if word not in filters_db["chats"][chat_id]["keywords"]:
-                    filters_db["chats"][chat_id]["keywords"].append(word)
-                save_filters()
-                send_msg(chat_id, f"✅ کلمه کلیدی <b>\"{word}\"</b> اضافه شد.")
-            elif sub == "del" and len(args) > 2:
-                word = " ".join(args[2:]).lower().strip()
-                filters_db["chats"][chat_id]["keywords"] = [w for w in filters_db["chats"][chat_id]["keywords"] if w != word]
-                save_filters()
-                send_msg(chat_id, f"✅ کلمه کلیدی <b>\"{word}\"</b> حذف شد.")
-            else:
-                kws = filters_db["chats"][chat_id]["keywords"]
-                if kws:
-                    send_msg(chat_id, "🗝 <b>کلمات کلیدی فیلتر فعال:</b>\n\n" + "\n".join([f"• <code>{w}</code>" for w in kws]))
-                else:
-                    send_msg(chat_id, "💡 فیلتر کلمه کلیدی برای این چت تعریف نشده است.")
-
-    # Confirm and clear updates queue on Telegram
-    if highest_id > 0:
-        with open(OFFSET_FILE, "w") as f:
-            json.dump({"offset": highest_id + 1}, f)
-        try:
-            requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={highest_id + 1}&limit=1", timeout=5)
-        except:
-            pass
-
-# ==========================================
-# TWITTER SCRApING & FORWARDING LOOP
+# TWITTER SCRAPING & FORWARDING LOOP
 # ==========================================
 def parse_rss_xml(xmlText):
     items = []
@@ -329,6 +206,7 @@ def format_message(username, clean_text, translated_text, tweet_link):
 def monitor_twitter_accounts():
     global tracked, sent_ids
     if not tracked:
+        print("No tracked accounts found in database.")
         return
 
     # Nitter is the best and only reliable public source in 2026!
@@ -406,13 +284,19 @@ def monitor_twitter_accounts():
                 if tid in sent_list:
                     continue
 
-                chat_filters = filters_db.get("chats", {}).get(chat_id, {})
+                # Load settings from Cloudflare KV (instantly updated by CF Webhook)
+                # Fallback to defaults if missing
+                try:
+                    r_settings = requests.get(f"{CF_WORKER_URL}/api/kv?key=chat_settings:{chat_id}", headers={"X-API-Key": CF_API_SECRET}, timeout=10)
+                    chat_filters = r_settings.json() if r_settings.status_code == 200 else {}
+                except:
+                    chat_filters = {}
                 
                 # Filter RT
-                if is_rt and chat_filters.get("filter_rt", True):
+                if is_rt and chat_filters.get("filter_rt", False):
                     continue
                 # Filter Reply
-                if is_reply and chat_filters.get("filter_reply", True):
+                if is_reply and chat_filters.get("filter_reply", False):
                     continue
                 # Filter Keywords
                 kws = chat_filters.get("keywords", [])
@@ -462,12 +346,8 @@ def main():
         print("TELEGRAM_BOT_TOKEN is missing!")
         return
 
-    print("Step 1: Processing Telegram Commands...")
-    process_telegram_commands()
-
-    print("Step 2: Checking Twitter Updates...")
+    print("Checking Twitter Updates...")
     monitor_twitter_accounts()
-
     print("Done! Executed successfully.")
 
 if __name__ == "__main__":
